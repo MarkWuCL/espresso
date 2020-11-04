@@ -23,6 +23,7 @@ from omegaconf import II, DictConfig
 from espresso.data import (
     AliScpCachedDataset,
     AsrChainDataset,
+    AsrK2Dataset,
     AsrXentDataset,
     AsrDictionary,
     AsrTextDataset,
@@ -74,6 +75,7 @@ class SpeechRecognitionHybridConfig(FairseqDataclass):
         },
     )
     feat_in_channels: int = field(default=1, metadata={"help": "feature input channels"})
+    use_k2_dataset: bool = field(default=False, metadata={"help": "if True use K2 dataset"})
     specaugment_config: Optional[str] = field(
         default=None,
         metadata={
@@ -144,6 +146,22 @@ class SpeechRecognitionHybridConfig(FairseqDataclass):
     required_seq_len_multiple: int = II("dataset.required_seq_len_multiple")
     criterion_name: str = II("criterion._name")
     max_epoch: int = II("optimization.max_epoch")  # to determine whether in trainig stage
+
+
+def get_k2_dataset_from_json(data_path, split, shuffle=True, pad_to_multiple=1, seed=1):
+    try:
+        # TODO use pip install once it's available
+        from espresso.tools.lhotse.cut import CutSet
+    except ImportError:
+        raise ImportError("Please install Lhotse by `make lhotse` after entering espresso/tools")
+
+    data_json_path = os.path.join(data_path, "cuts_{}.json".format(split))
+    if not os.path.isfile(data_json_path):
+        raise FileNotFoundError("Dataset not found: {}".format(data_json_path))
+
+    cut_set = CutSet.from_json(data_json_path)
+    logger.info("{} {} examples".format(data_json_path, len(cut_set)))
+    return AsrK2Dataset(cut_set, shuffle=shuffle, pad_to_multiple=pad_to_multiple)
 
 
 def get_asr_dataset_from_json(
@@ -343,6 +361,7 @@ class SpeechRecognitionHybridTask(FairseqTask):
         super().__init__(cfg)
         self.dictionary = dictionary
         self.feat_in_channels = cfg.feat_in_channels
+        self.use_k2_dataset = cfg.use_k2_dataset
         self.specaugment_config = cfg.specaugment_config
         self.num_targets = cfg.num_targets
         self.training_stage = (cfg.max_epoch > 0)  # a hack
@@ -401,6 +420,17 @@ class SpeechRecognitionHybridTask(FairseqTask):
             # if not training data set, use the first shard for valid and test
             paths = paths[:1]
         data_path = paths[(epoch - 1) % len(paths)]
+
+        if self.use_k2_dataset:
+            self.datasets[split] = get_k2_dataset_from_json(
+                data_path,
+                split,
+                shuffle=(split != self.cfg.gen_subset),
+                pad_to_multiple=self.cfg.required_seq_len_multiple,
+                seed=self.cfg.seed,
+            )
+            self.feat_dim = self.datasets[split].feat_dim
+            return
 
         self.datasets[split] = get_asr_dataset_from_json(
             data_path,
